@@ -33,3 +33,14 @@ images. The fork has no scheduled container registry cleanup workflow.
 - Protect version tags against updates and deletion, and keep branch rules aligned
   with the actual PR Validation and CodeQL job names.
 - A published version should receive a new version number for later corrections.
+
+## Resume a built candidate
+
+If testing fails after the candidate image is built, use the manual release
+workflow with the existing `release_tag`, `candidate_digest` and original UTC
+`build_date`. It checks out the tagged source, skips rebuilding, verifies both
+platform-specific image digests against the version, revision and build date,
+then promotes the original multi-platform digest. AMD64 and ARM64 tests pull
+separate platform manifests so Docker does not overwrite one platform with
+another under the same multi-platform digest. The recovery path must only be
+used for a version whose image and GitHub Release have not been published.
