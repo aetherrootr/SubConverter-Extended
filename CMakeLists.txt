@@ -570,6 +570,19 @@ IF(BUILD_TESTS)
     ADD_TEST(NAME clash_proxy COMMAND clash_proxy_test)
     SET_TESTS_PROPERTIES(clash_proxy PROPERTIES LABELS fast)
 
+    ADD_EXECUTABLE(proxy_group_health_check_test
+        tests/proxy_group_health_check_test.cpp
+        src/utils/string.cpp)
+    TARGET_COMPILE_DEFINITIONS(proxy_group_health_check_test PRIVATE NO_JS_RUNTIME)
+    TARGET_INCLUDE_DIRECTORIES(proxy_group_health_check_test PRIVATE src)
+    TARGET_INCLUDE_DIRECTORIES(proxy_group_health_check_test SYSTEM PRIVATE
+        ${YAML_CPP_INCLUDE_DIRS})
+    TARGET_LINK_DIRECTORIES(proxy_group_health_check_test PRIVATE
+        ${YAML_CPP_LIBRARY_DIRS})
+    TARGET_LINK_LIBRARIES(proxy_group_health_check_test ${YAML_CPP_LIBRARY})
+    ADD_TEST(NAME proxy_group_health_check COMMAND proxy_group_health_check_test)
+    SET_TESTS_PROPERTIES(proxy_group_health_check PROPERTIES LABELS fast)
+
     ADD_EXECUTABLE(concurrency_primitives_test
         tests/concurrency_primitives_test.cpp
         src/runtime/blocking_io_executor.cpp
@@ -732,6 +745,7 @@ IF(BUILD_TESTS)
         ruleset_output_test
         external_rules_test
         clash_proxy_test
+        proxy_group_health_check_test
         concurrency_primitives_test
         quickjs_allocator_test
         settings_view_test
