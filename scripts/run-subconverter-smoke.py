@@ -450,6 +450,40 @@ def assert_local_group_matcher_matrix(base_url: str, timeout: int) -> None:
             )
 
 
+def assert_group_health_check(
+    base_url: str, timeout: int, remote_subscription_url: str | None
+) -> None:
+    # Inline TOML exercises the real template parser and Clash exporter.
+    template = "version = 1\n[custom]\nenable_rule_generator = false\n"
+    expected = {}
+    for kind in ("url-test", "load-balance", "fallback"):
+        for lazy in (False, True):
+            name = f"Health-{kind}-{str(lazy).lower()}"
+            expected[name] = lazy
+            template += (
+                "\n[[custom_groups]]\n"
+                f"name = '{name}'\ntype = '{kind}'\nrule = ['.*']\n"
+                "url = 'https://example.test/204'\ninterval = 60\n"
+                f"timeout = 2\nlazy = {str(lazy).lower()}\n"
+            )
+    config = "data:text/plain;base64," + base64.urlsafe_b64encode(
+        template.encode()
+    ).decode("ascii")
+    sources = [SAMPLE_SS_LINK]
+    if remote_subscription_url:
+        sources.append(f"provider:HealthOne,{remote_subscription_url}")
+    for source in sources:
+        output = fetch(
+            base_url, "/sub", {"target": "clash", "url": source, "config": config}, timeout
+        )
+        for name, lazy in expected.items():
+            block = proxy_group_block_from_output(output, name)
+            if not re.search(r"(?m)^    timeout: 2000\s*$", block):
+                raise AssertionError(f"{name} lost timeout or used the wrong unit: {block}")
+            if not re.search(rf"(?m)^    lazy: {str(lazy).lower()}\s*$", block):
+                raise AssertionError(f"{name} lost lazy: {block}")
+
+
 def assert_select_health_check(
     base_url: str, timeout: int, remote_subscription_url: str | None
 ) -> None:
@@ -1001,6 +1035,7 @@ def run_checks(
 
     assert_local_group_matcher_matrix(base_url, timeout)
     assert_select_health_check(base_url, timeout, remote_subscription_url)
+    assert_group_health_check(base_url, timeout, remote_subscription_url)
     assert_reality_mlkem768_bridge(base_url, timeout)
 
     if verify_non_clash:

@@ -1,21 +1,145 @@
-name: Formal Release
+name: Publish fork release to GHCR
 
 on:
   push:
     tags:
       - 'v*.*.*'
 
-# Formal versions are serialized so one release finishes before the next starts.
-concurrency:
-  group: formal-release
-  cancel-in-progress: false
-
 permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: fork-formal-release
+  cancel-in-progress: false
+
 jobs:
-  release:
-    name: Tag release
-    uses: ./.github/workflows/build-dockerhub.yml
-    secrets: inherit
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Resolve build identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::Use a version tag such as v1.9.14 or v1.9.14-aether.1"
+            exit 1
+          fi
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve pinned dependencies
+        id: dependencies
+        shell: bash
+        run: |
+          python3 scripts/ci/dependency_snapshot.py check
+          python3 scripts/ci/dependency_snapshot.py emit --github-env "$GITHUB_ENV"
+
+      - name: Prepare build arguments
+        id: build_args
+        shell: bash
+        env:
+          THREADS: '4'
+          SHA: ${{ steps.identity.outputs.revision }}
+          VERSION: ${{ github.ref_name }}
+          BUILD_DATE: ${{ steps.identity.outputs.created }}
+          BUILD_TESTS: 'false'
+        run: |
+          set -euo pipefail
+          {
+            echo 'values<<BUILD_ARGS_END'
+            bash scripts/ci/docker-build-args.sh
+            echo 'BUILD_ARGS_END'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build candidate image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/aetherrootr/subconverter-extended:build-${{ github.run_id }}-${{ github.run_attempt }}
+          build-args: ${{ steps.build_args.outputs.values }}
+          labels: |
+            org.opencontainers.image.url=https://github.com/aetherrootr/SubConverter-Extended
+            org.opencontainers.image.source=https://github.com/aetherrootr/SubConverter-Extended
+            org.opencontainers.image.revision=${{ steps.identity.outputs.revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test amd64 image
+        uses: ./.github/actions/smoke-docker-image
+        with:
+          image: ghcr.io/aetherrootr/subconverter-extended@${{ steps.build.outputs.digest }}
+          platform: linux/amd64
+          expected-version: ${{ github.ref_name }}
+          expected-revision: ${{ steps.identity.outputs.revision }}
+          expected-build-date: ${{ steps.identity.outputs.created }}
+
+      - name: Smoke test arm64 image
+        uses: ./.github/actions/smoke-docker-image
+        with:
+          image: ghcr.io/aetherrootr/subconverter-extended@${{ steps.build.outputs.digest }}
+          platform: linux/arm64
+          expected-version: ${{ github.ref_name }}
+          expected-revision: ${{ steps.identity.outputs.revision }}
+          expected-build-date: ${{ steps.identity.outputs.created }}
+
+      - name: Publish tested version image
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "ghcr.io/aetherrootr/subconverter-extended:$RELEASE_TAG" \
+            "ghcr.io/aetherrootr/subconverter-extended@$IMAGE_DIGEST"
+
+      - name: Publish GitHub Release
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Container: ghcr.io/aetherrootr/subconverter-extended:%s\n\nDigest: %s\n' \
+            "$RELEASE_TAG" "$IMAGE_DIGEST" > "$RUNNER_TEMP/release-notes.md"
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            RELEASE_FLAGS=()
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              RELEASE_FLAGS+=(--prerelease --latest=false)
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" "${RELEASE_FLAGS[@]}"
+          fi
+
+      - name: Advance latest for stable releases
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t ghcr.io/aetherrootr/subconverter-extended:latest \
+            "ghcr.io/aetherrootr/subconverter-extended@$IMAGE_DIGEST"

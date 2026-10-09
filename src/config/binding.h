@@ -63,6 +63,8 @@ namespace toml
                 conf.Type = ProxyGroupType::LoadBalance;
                 conf.Url = find<String>(v, "url");
                 conf.Interval = find<Integer>(v, "interval");
+                if(v.contains("lazy"))
+                    conf.Lazy = find_or<bool>(v, "lazy", false);
                 switch(hash_(strategy))
                 {
                 case "consistent-hashing"_hash:
@@ -79,6 +81,8 @@ namespace toml
                 conf.Type = ProxyGroupType::Fallback;
                 conf.Url = find<String>(v, "url");
                 conf.Interval = find<Integer>(v, "interval");
+                if(v.contains("lazy"))
+                    conf.Lazy = find_or<bool>(v, "lazy", false);
                 if(v.contains("evaluate-before-use"))
                     conf.EvaluateBeforeUse = find_or(v, "evaluate-before-use", conf.EvaluateBeforeUse.get());
                 break;

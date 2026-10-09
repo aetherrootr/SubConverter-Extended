@@ -166,7 +166,10 @@ assert_trace() {
   }
 }
 
-mapfile -t bridge_sources < <(
+bridge_sources=()
+while IFS= read -r source; do
+  bridge_sources+=("$source")
+done < <(
   git -C "$REPOSITORY" ls-files 'bridge/*.go' |
     awk -F/ 'NF == 2' |
     sed 's#^bridge/##' |
@@ -239,62 +242,33 @@ assert_trace "--load"
 
 echo "CI delivery script contract passed"
 
-BUILD_WORKFLOW="$REPOSITORY/.github/workflows/build-dockerhub.yml"
+SYNC_WORKFLOW="$REPOSITORY/.github/workflows/sync-dev-to-master.yml"
+
+# The release path uses one registry and tests both supported architectures
+# before promoting the candidate to a version tag.
+python3 - "$REPOSITORY" <<'PY_CHECK'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+workflows = root / '.github/workflows'
+for path in workflows.glob('*.yml'):
+    text = path.read_text().lower()
+    assert 'dockerhub' not in text and 'docker hub' not in text, path
+release = (workflows / 'release.yml').read_text()
+assert 'ghcr.io/aetherrootr/subconverter-extended' in release
+assert 'platforms: linux/amd64,linux/arm64' in release
+assert 'scripts/ci/docker-build-args.sh' in release
+assert release.index('Smoke test amd64 image') < release.index('Publish tested version image')
+assert release.index('Smoke test arm64 image') < release.index('Publish tested version image')
+assert release.index('Publish GitHub Release') < release.index('Advance latest for stable releases')
+PY_CHECK
+
+echo "GHCR release workflow contract passed"
+
 WINDOWS_BUILD_SCRIPT="$REPOSITORY/scripts/build-windows-amd64.sh"
 OPENWRT_PACKAGE_SCRIPT="$REPOSITORY/scripts/package-openwrt-apk.sh"
 OPENWRT_SMOKE_ACTION="$REPOSITORY/.github/actions/smoke-openwrt-apk/action.yml"
-CLEANUP_WORKFLOW="$REPOSITORY/.github/workflows/cleanup-container-registry.yml"
-SYNC_WORKFLOW="$REPOSITORY/.github/workflows/sync-dev-to-master.yml"
 
-grep -Fq 'group: build-core-${{ github.ref }}' "$BUILD_WORKFLOW"
-grep -Fq 'group: container-registry-cleanup' "$BUILD_WORKFLOW"
-grep -Fq 'group: container-registry-cleanup' "$CLEANUP_WORKFLOW"
-for forbidden_cloud_test in \
-  'validation_profile:' \
-  'final-force-max' \
-  'Validate Source Once' \
-  'sanitizer-bootstrap:' \
-  'ASan/UBSan' \
-  'strict-force-max-gate:' \
-  'BUILD_TESTS: "true"'; do
-  if grep -Fq "$forbidden_cloud_test" "$BUILD_WORKFLOW"; then
-    echo "cloud build workflow still contains test-only path: $forbidden_cloud_test" >&2
-    exit 1
-  fi
-done
-
-cross_build_block="$(sed -n '/^  cross-build:/,/^  build-linux:/p' "$BUILD_WORKFLOW")"
-grep -Fq 'Compile without loading or publishing an image' <<<"$cross_build_block"
-grep -Fq 'BUILD_TESTS: "false"' <<<"$cross_build_block"
-if grep -Eq 'Smoke test|Package strict|Set up QEMU' <<<"$cross_build_block"; then
-  echo "cross-build must compile only" >&2
-  exit 1
-fi
-
-build_linux_block="$(sed -n '/^  build-linux:/,/^  build-windows-amd64:/p' "$BUILD_WORKFLOW")"
-deny_build_linux_registry_write=false
-if grep -Eq 'docker login|docker push|--push|aethersailor/subconverter-extended:ci-|ghcr.io/aethersailor/subconverter-extended:ci-' <<<"$build_linux_block"; then
-  deny_build_linux_registry_write=true
-fi
-if [ "$deny_build_linux_registry_write" = true ]; then
-  echo "build-linux still writes to a container registry" >&2
-  exit 1
-fi
-grep -Fq 'image: subconverter-extended:${{ matrix.arch }}-ci' <<<"$build_linux_block"
-grep -Fq 'docker save "subconverter-extended:${{ matrix.arch }}-ci"' <<<"$build_linux_block"
-grep -Fq 'name: docker-image-${{ matrix.arch }}' <<<"$build_linux_block"
-grep -Fq 'bash scripts/ci/build-linux-release.sh v0.0.0 amd64 x86_64' <<<"$build_linux_block"
-grep -Fq 'BUILD_TESTS: ${{ needs.prepare.outputs.mode == '\''dev'\'' && inputs.refresh_dependencies && matrix.extract_generated == '\''true'\'' }}' <<<"$build_linux_block"
-if grep -Eq 'Smoke test strict|Package strict|ASan|UBSan|ctest' <<<"$build_linux_block"; then
-  echo "dev Linux build still contains full or sanitizer tests" >&2
-  exit 1
-fi
-
-windows_block="$(sed -n '/^  build-windows-amd64:/,/^  merge-manifest:/p' "$BUILD_WORKFLOW")"
-grep -Fq "github.event_name == 'workflow_dispatch'" <<<"$windows_block"
-grep -Fq 'BUILD_TESTS: "false"' <<<"$windows_block"
-grep -Fq 'BUILD_TESTS="$BUILD_TESTS" bash scripts/build-windows-amd64.sh' <<<"$windows_block"
-grep -Fq "if: needs.prepare.outputs.is_release == 'true'" <<<"$windows_block"
 grep -Fq 'BUILD_TESTS="${BUILD_TESTS:-false}"' "$WINDOWS_BUILD_SCRIPT"
 grep -Fq -- '-DBUILD_TESTS="${BUILD_TESTS}"' "$WINDOWS_BUILD_SCRIPT"
 grep -Fq 'ctest --test-dir "${BUILD_DIR}" --output-on-failure --timeout 120' "$WINDOWS_BUILD_SCRIPT"
@@ -311,38 +285,6 @@ grep -Fq -- '--ulimit nofile=512:512' "$OPENWRT_SMOKE_ACTION"
 grep -Fq 'runtime_pref=/tmp/subconverter-force-max-pref.toml' "$OPENWRT_SMOKE_ACTION"
 grep -Fq 'max_allowed_download_size = 1048576' "$OPENWRT_SMOKE_ACTION"
 
-publish_block="$(sed -n '/^  merge-manifest:/,/^  create-release:/p' "$BUILD_WORKFLOW")"
-grep -Fq 'needs: [prepare, cross-build, build-linux, build-windows-amd64]' <<<"$publish_block"
-grep -Fq "needs.build-windows-amd64.result == 'success'" <<<"$publish_block"
-if grep -Eq 'sanitizer|validate-source|strict-force-max' <<<"$publish_block"; then
-  echo "publish path still depends on removed cloud tests" >&2
-  exit 1
-fi
-grep -Fq 'pattern: docker-image-*' <<<"$publish_block"
-grep -Fq 'gzip -dc "images/$archive" | docker load' <<<"$publish_block"
-grep -Fq 'actual_platform="$(docker image inspect' <<<"$publish_block"
-grep -Fq 'docker push "$dockerhub_candidate"' <<<"$publish_block"
-grep -Fq 'docker push "$ghcr_candidate"' <<<"$publish_block"
-grep -Fq 'Candidate digest differs across registries' <<<"$publish_block"
-
-cleanup_block="$(sed -n '/^  cleanup-transient-images:/,$p' "$BUILD_WORKFLOW")"
-grep -Fq 'always() &&' <<<"$cleanup_block"
-grep -Fq "needs.prepare.outputs.mode == 'dev'" <<<"$cleanup_block"
-grep -Fq "needs.prepare.outputs.mode == 'release'" <<<"$cleanup_block"
-grep -Fq -- '--prune-orphans' <<<"$cleanup_block"
-grep -Fq -- '--current-tag ci-dev-amd64' <<<"$cleanup_block"
-grep -Fq -- '--current-prefix "ci-${VERSION}-${GITHUB_RUN_ID}-"' <<<"$cleanup_block"
-if grep -Fq '!cancelled()' <<<"$cleanup_block" || \
-   grep -Fq "needs.merge-manifest.result == 'success'" <<<"$cleanup_block" || \
-   grep -Fq "needs.verify-release-complete.result == 'success'" <<<"$cleanup_block"; then
-  echo "cleanup job is still restricted to successful publication" >&2
-  exit 1
-fi
-
-grep -Fq 'schedule:' "$CLEANUP_WORKFLOW"
-grep -Fq 'python3 scripts/ci/cleanup_container_registry.py --prune-all --apply' "$CLEANUP_WORKFLOW"
-
-echo "Container registry cleanup contract passed"
 
 grep -Fq 'git cat-file -e "HEAD:$file"' "$SYNC_WORKFLOW"
 grep -Fq 'git ls-tree -rz --name-only HEAD > "$master_tree"' "$SYNC_WORKFLOW"

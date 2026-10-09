@@ -15,6 +15,7 @@
 #include "config/regmatch.h"
 #include "external_rules.h"
 #include "generator/config/clash_proxy.h"
+#include "generator/config/clash_health_check.h"
 #include "generator/config/subexport.h"
 #include "generator/template/templates.h"
 #include "handler/settings.h"
@@ -1913,6 +1914,10 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
           "https://www.gstatic.com/generate_204";
       single_provider["health-check"]["interval"] = 300;
 
+      preserveClashProviderHealthCheck(
+          single_provider,
+          static_cast<const YAML::Node &>(yamlnode)["proxy-providers"], p.name);
+
       // 添加 override 配置（如果用户指定了 udp 或 scv 参数）
       bool has_override = false;
       YAML::Node override_node;
@@ -1969,10 +1974,9 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
     case ProxyGroupType::Smart:
       [[fallthrough]];
     case ProxyGroupType::URLTest:
-      if (!x.Lazy.is_undef())
-        singlegroup["lazy"] = x.Lazy.get();
       [[fallthrough]];
     case ProxyGroupType::Fallback:
+      applyClashGroupHealthCheck(singlegroup, x);
       singlegroup["url"] = x.Url;
       if (x.Interval > 0)
         singlegroup["interval"] = x.Interval;
