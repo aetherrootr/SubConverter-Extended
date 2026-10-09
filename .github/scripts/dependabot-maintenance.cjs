@@ -1,10 +1,7 @@
 'use strict';
 
 const VALIDATION = 'pr-validation.yml';
-const BUILD = 'build-dockerhub.yml';
 const CODEQL = 'codeql.yml';
-const REFRESH_TITLE = 'Refresh upstream dependencies on dev';
-const GENERATED_TITLE = 'chore: update generated development inputs after build [skip ci]';
 const DAY = 86400000;
 
 function eligible(pull, repository) {
@@ -57,21 +54,11 @@ module.exports = async function maintain({github, context, core, rebaseGithub}) 
   // on the next event/schedule too, including a crash between merge and dispatch.
   async function reconcileDelivery() {
     const head = await branch();
-    const {data: commit} = await github.rest.repos.getCommit({...repo, ref: head});
-    const generated = commit.parents.length === 1 &&
-      commit.commit.message.split('\n')[0] === GENERATED_TITLE &&
-      commit.committer?.login === 'github-actions[bot]';
-    const source = generated ? commit.parents[0].sha : head;
     let ready = true;
-    for (const workflow of [BUILD, CODEQL]) {
-      const checkedSource = workflow === CODEQL ? head : source;
-      const runs = await runsFor(workflow, {branch: 'dev', head_sha: checkedSource});
-      if (checkedSource !== head) runs.push(...await runsFor(workflow, {branch: 'dev', head_sha: head}));
-      // A speculative upstream refresh must not poison routine dev delivery.
-      // Wait while it runs, but retain the last successful baseline if it fails.
+    for (const workflow of [CODEQL]) {
+      const runs = await runsFor(workflow, {branch: 'dev', head_sha: head});
       if (runs.some(run => run.status !== 'completed')) { ready = false; continue; }
-      const run = latest(runs.filter(run =>
-        run.display_title !== REFRESH_TITLE || run.conclusion === 'success'));
+      const run = latest(runs);
       if (!run) {
         ready = false;
         if (await branch() !== head) return false;
@@ -154,17 +141,6 @@ module.exports = async function maintain({github, context, core, rebaseGithub}) 
       }
     }
 
-    if (candidates.length === 0 && deliveryReady &&
-        (context.eventName === 'schedule' || process.env.REFRESH_DEPENDENCIES === 'true')) {
-      const refreshRuns = (await runsFor(BUILD, {branch: 'dev', event: 'workflow_dispatch'}))
-        .filter(run => run.display_title === REFRESH_TITLE);
-      const previous = latest(refreshRuns);
-      if (!previous || Date.now() - Date.parse(previous.created_at) >= 7 * DAY) {
-        await act('Dispatch the weekly upstream refresh on dev.', () => github.rest.actions.createWorkflowDispatch({
-          ...repo, workflow_id: BUILD, ref: 'dev', inputs: {refresh_dependencies: 'true'},
-        }));
-      } else note(`Weekly upstream refresh already attempted: ${previous.html_url}`);
-    }
   } finally {
     await core.summary.addHeading('Dependabot maintenance').addList(rows.length ? rows : ['No action needed.']).write();
   }

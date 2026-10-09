@@ -4,7 +4,6 @@ on:
   workflow_run:
     workflows:
       - PR Validation
-      - Build and Push Docker image
       - CodeQL
     types: [completed]
   schedule:
@@ -13,10 +12,6 @@ on:
     inputs:
       dry_run:
         description: Inspect the queue without making changes
-        type: boolean
-        default: false
-      refresh_dependencies:
-        description: Request the separately validated full upstream refresh on dev
         type: boolean
         default: false
 
@@ -47,7 +42,6 @@ jobs:
         env:
           AUTOMERGE_MODE: ${{ vars.DEPENDABOT_AUTOMERGE_MODE || 'off' }}
           DRY_RUN: ${{ inputs.dry_run || false }}
-          REFRESH_DEPENDENCIES: ${{ inputs.refresh_dependencies || false }}
           # Dependabot rejects rebase commands from github-actions[bot]. This
           # credential is used only for that command, never for merging a PR.
           REBASE_TOKEN: ${{ secrets.PAT_TOKEN }}

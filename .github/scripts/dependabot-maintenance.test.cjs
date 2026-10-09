@@ -67,11 +67,9 @@ function fixture(options = {}) {
       created_at: new Date().toISOString()}] : [];
     if (method === 'runs') {
       if (args.workflow_id === 'pr-validation.yml') return [{...run(), ...options.validation}];
-      if (args.event === 'workflow_dispatch') return options.refreshRuns || [];
       if (head === 'merged' || options.missingDelivery) return [];
       const normal = {id: 10, run_attempt: 1, status: 'completed', conclusion: 'success'};
-      return options.failedRefresh ? [normal, {id: 20, status: 'completed', conclusion: 'failure',
-        display_title: 'Refresh upstream dependencies on dev'}] : [normal];
+      return [{...normal, ...options.delivery}];
     }
     throw new Error(`Unexpected API request: ${method}`);
   }};
@@ -87,23 +85,22 @@ async function execute(options = {}) {
   const before = {...process.env};
   process.env.AUTOMERGE_MODE = options.mode || 'active';
   process.env.DRY_RUN = options.dry ? 'true' : 'false';
-  process.env.REFRESH_DEPENDENCIES = 'false';
   try {
     const f = fixture(options); await maintain(f); return f;
   } finally {
-    for (const key of ['AUTOMERGE_MODE', 'DRY_RUN', 'REFRESH_DEPENDENCIES']) {
+    for (const key of ['AUTOMERGE_MODE', 'DRY_RUN']) {
       if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key];
     }
   }
 }
 
-test('successful current candidate merges with SHA precondition and dispatches both dev workflows', async () => {
+test('successful current candidate merges with SHA precondition and dispatches dev CodeQL', async () => {
   const f = await execute();
   assert.deepEqual(f.errors, []);
-  assert.deepEqual(f.writes.map(w => w[0]), ['merge', 'createWorkflowDispatch', 'createWorkflowDispatch']);
+  assert.deepEqual(f.writes.map(w => w[0]), ['merge', 'createWorkflowDispatch']);
   assert.equal(f.writes[0][1].sha, 'candidate');
   assert.deepEqual(f.writes.slice(1).map(w => [w[1].workflow_id, w[1].ref]),
-    [['build-dockerhub.yml', 'dev'], ['codeql.yml', 'dev']]);
+    [['codeql.yml', 'dev']]);
 });
 
 test('observe, dry-run and off modes never write', async () => {
@@ -130,21 +127,16 @@ test('failed or deliberately stopped validation never triggers an automatic retr
 
 test('missing post-merge CI is repaired without merging another dependency first', async () => {
   const f = await execute({missingDelivery: true});
-  assert.deepEqual(f.writes.map(w => w[0]), ['createWorkflowDispatch', 'createWorkflowDispatch']);
+  assert.deepEqual(f.writes.map(w => w[0]), ['createWorkflowDispatch']);
 });
 
-test('failed speculative refresh does not block a validated routine update', async () => {
-  assert.equal((await execute({failedRefresh: true})).writes[0][0], 'merge');
+test('failed dev CodeQL blocks dependency merges without an automatic retry', async () => {
+  assert.deepEqual((await execute({delivery: {conclusion: 'failure'}})).writes, []);
 });
 
-test('weekly refresh runs on dev with an empty queue and is deduplicated', async () => {
+test('scheduled maintenance with an empty queue only keeps the schedule active', async () => {
   const f = await execute({empty: true, eventName: 'schedule'});
-  assert.equal(f.writes.length, 2);
-  assert.equal(f.writes[0][0], 'enableWorkflow');
-  assert.deepEqual(f.writes[1][1].inputs, {refresh_dependencies: 'true'});
-  assert.equal(f.writes[1][1].ref, 'dev');
-  const recent = {id: 60, display_title: 'Refresh upstream dependencies on dev', created_at: new Date().toISOString()};
-  assert.deepEqual((await execute({empty: true, eventName: 'schedule', refreshRuns: [recent]})).writes.map(w => w[0]), ['enableWorkflow']);
+  assert.deepEqual(f.writes.map(w => w[0]), ['enableWorkflow']);
 });
 
 test('keepalive respects explicit workflow disablement and read-only mode', async () => {
