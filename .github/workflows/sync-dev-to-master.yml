@@ -25,6 +25,8 @@ permissions:
 
 jobs:
   sync-branches:
+    # This upstream release flow requires Docker Hub; the fork uses tag pushes.
+    if: github.repository == 'Aethersailor/SubConverter-Extended'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout master

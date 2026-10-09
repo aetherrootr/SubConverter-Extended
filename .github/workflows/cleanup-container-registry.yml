@@ -16,6 +16,8 @@ concurrency:
 
 jobs:
   cleanup:
+    # Upstream registry cleanup must not run against the fork's GHCR releases.
+    if: github.repository == 'Aethersailor/SubConverter-Extended'
     name: "🧹 清理 Docker Hub 与 GHCR"
     runs-on: ubuntu-latest
     timeout-minutes: 45

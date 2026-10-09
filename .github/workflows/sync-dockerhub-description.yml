@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   sync:
-    if: github.ref == 'refs/heads/master'
+    if: github.repository == 'Aethersailor/SubConverter-Extended' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
