@@ -106,6 +106,7 @@ def main():
                         if request(port, "/healthz")[0] == 200:
                             break
                     except (OSError, urllib.error.URLError):
+                        # The listener may not be ready yet; retry within the startup deadline.
                         pass
                     time.sleep(0.1)
                 else:
