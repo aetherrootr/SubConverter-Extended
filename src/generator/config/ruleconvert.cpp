@@ -9,8 +9,10 @@
 #include <string>
 #include <unordered_set>
 
+#include "config/ruleset_comment.h"
 #include "handler/settings.h"
 #include "handler/settings_view.h"
+#include "utils/base64/base64.h"
 #include "utils/logger.h"
 #include "utils/concurrent_lru_cache.h"
 #include "utils/cooperative_cpu.h"
@@ -63,11 +65,7 @@ static std::string convertRulesetUncached(const std::string &content, int type)
             if(lineSize && strLine[lineSize - 1] == '\r') //remove line break
                 strLine.erase(--lineSize);
 
-            if(strFind(strLine, "//"))
-            {
-                strLine.erase(strLine.find("//"));
-                strLine = trimWhitespace(strLine);
-            }
+            stripRulesetComment(strLine, true);
 
             if(!strLine.empty() && (strLine[0] != ';' && strLine[0] != '#' && !(lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')))
             {
@@ -422,16 +420,6 @@ bool normalizeStashRule(std::string rule, const std::string &group,
             return false;
     }
 
-    if(type == "GEOIP")
-    {
-        const std::string &country = fields[1];
-        if(country.size() != 2 ||
-           !std::all_of(country.begin(), country.end(), [](unsigned char ch) {
-               return std::isalpha(ch) != 0;
-           }))
-            return false;
-    }
-
     output = terminal_rule ? "MATCH," + group
                            : type + "," + fields[1] + "," + group;
     if(no_resolve)
@@ -682,13 +670,9 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
             lineSize = strLine.size();
             if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                 continue;
-            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                 continue;
-            if(strFind(strLine, "//"))
-            {
-                strLine.erase(strLine.find("//"));
-                strLine = trimWhitespace(strLine);
-            }
+            stripRulesetComment(strLine);
             strLine = appendClashRuleTarget(strLine, rule_group);
             strLine =
                 appendClashIpCidrNoResolve(strLine, x.rule_type, x.options);
@@ -766,13 +750,9 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
             lineSize = strLine.size();
             if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                 continue;
-            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [strLine](const std::string& type){ return startsWith(strLine, type); }))
+            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](const std::string& type){ return startsWith(strLine, type); }))
                 continue;
-            if(strFind(strLine, "//"))
-            {
-                strLine.erase(strLine.find("//"));
-                strLine = trimWhitespace(strLine);
-            }
+            stripRulesetComment(strLine);
 
             strLine = appendClashRuleTarget(strLine, rule_group);
             strLine =
@@ -967,31 +947,27 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                         continue;
                     [[fallthrough]];
                 case -1:
-                    if(!std::any_of(QuanXRuleTypes.begin(), QuanXRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                    if(!std::any_of(QuanXRuleTypes.begin(), QuanXRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                         continue;
                     break;
                 case -3:
-                    if(!std::any_of(SurfRuleTypes.begin(), SurfRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                    if(!std::any_of(SurfRuleTypes.begin(), SurfRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                         continue;
                     break;
                 default:
                     if(surge_ver > 2)
                     {
-                        if(!std::any_of(SurgeRuleTypes.begin(), SurgeRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                        if(!std::any_of(SurgeRuleTypes.begin(), SurgeRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                             continue;
                     }
                     else
                     {
-                        if(!std::any_of(Surge2RuleTypes.begin(), Surge2RuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                        if(!std::any_of(Surge2RuleTypes.begin(), Surge2RuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                             continue;
                     }
                 }
 
-                if(strFind(strLine, "//"))
-                {
-                    strLine.erase(strLine.find("//"));
-                    strLine = trimWhitespace(strLine);
-                }
+                stripRulesetComment(strLine);
 
                 if(surge_ver == -1 || surge_ver == -2)
                 {
@@ -1060,21 +1036,28 @@ bool appendSingBoxRule(std::vector<std::string_view> &args,
                        const std::string &rule_group) {
     args.clear();
     split(args, rule, ',');
-    if (args.size() < 2)
+    if (args.empty())
         return false;
 
     const std::string type = toUpper(trimWhitespace(std::string(args[0])));
-    std::string value = toLower(trimWhitespace(std::string(args[1])));
-    if (none_of(SingBoxRuleTypes, [&](const std::string &candidate) {
-          return type == candidate;
-        }))
-        return false;
-
     if (type == "MATCH" || type == "FINAL") {
         final = rule_group;
         return true;
     }
 
+    if (args.size() < 2)
+        return false;
+    if (none_of(SingBoxRuleTypes, [&](const std::string &candidate) {
+          return type == candidate;
+        }))
+        return false;
+
+    std::string value = trimWhitespace(std::string(args[1]));
+    if (type != "DOMAIN-REGEX" && type != "INBOUND" &&
+        type != "PROCESS-NAME" && type != "PROCESS-PATH" &&
+        type != "PACKAGE-NAME" && type != "USER")
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return std::tolower(ch); });
     std::string field;
     SingBoxRuleValueKind kind = SingBoxRuleValueKind::String;
     bool match_rule_set_source = false;
@@ -1310,8 +1293,6 @@ void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent
         rules.PushBack(direct_object, allocator);
     }
 
-    // auto dns_object = buildObject(allocator, "protocol", "dns", "outbound", "dns-out");
-    // rules.PushBack(dns_object, allocator);
 
     std::vector<std::string_view> temp(4);
     std::set<std::string> geosite_codes, geoip_codes;
@@ -1357,11 +1338,7 @@ void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent
             lineSize = strLine.size();
             if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                 continue;
-            if(strFind(strLine, "//"))
-            {
-                strLine.erase(strLine.find("//"));
-                strLine = trimWhitespace(strLine);
-            }
+            stripRulesetComment(strLine);
             if (appendSingBoxRule(temp, buckets, geosite_codes, geoip_codes,
                                   strLine, final, rule_group))
             {

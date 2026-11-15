@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   auto-merge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # Only default-branch maintenance code is loaded, never a PR checkout,

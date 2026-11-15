@@ -1,7 +1,12 @@
+#include <algorithm>
+#include <cctype>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cmath>
 #include <ctime>
+#include <limits>
+#include <stdexcept>
 
 #include "config/regmatch.h"
 #include "parser/config/proxy.h"
@@ -72,15 +77,34 @@ time_t dateStringToTimestamp(std::string date)
 
 bool getSubInfoFromHeader(const std::string &header, std::string &result)
 {
-    std::string pattern = R"(^(?i:Subscription-UserInfo): (.*?)\s*?$)", retStr;
-    if(regFind(header, pattern))
+    constexpr std::string_view name = "subscription-userinfo:";
+    std::string_view headers(header);
+    const auto response_start = headers.rfind("\nHTTP/");
+    if(response_start != std::string_view::npos)
+        headers.remove_prefix(response_start + 1);
+
+    while(!headers.empty())
     {
-        regGetMatch(header, pattern, 2, 0, &retStr);
-        if(!retStr.empty())
-        {
-            result = retStr;
-            return true;
-        }
+        const auto line_end = headers.find('\n');
+        auto line = headers.substr(0, line_end);
+        headers.remove_prefix(line_end == std::string_view::npos
+                                  ? headers.size() : line_end + 1);
+        if(line.empty() || line == "\r")
+            break;
+        if(line.size() < name.size() ||
+           !std::equal(name.begin(), name.end(), line.begin(),
+                       [](char expected, unsigned char actual) {
+                           return expected == std::tolower(actual);
+                       }))
+            continue;
+
+        line.remove_prefix(name.size());
+        const auto first = line.find_first_not_of(" \t\r");
+        if(first == std::string_view::npos)
+            return false;
+        const auto last = line.find_last_not_of(" \t\r");
+        result.assign(line.substr(first, last - first + 1));
+        return true;
     }
     return false;
 }
@@ -179,6 +203,38 @@ bool getSubInfoFromNodes(const std::vector<Proxy> &nodes, const RegexMatchConfig
     return true;
 }
 
+static bool parseSSDTrafficBytes(const std::string &value,
+                                 unsigned long long &bytes)
+{
+    if(value.empty())
+        return false;
+
+    double gibibytes;
+    size_t consumed;
+    try
+    {
+        gibibytes = std::stod(value, &consumed);
+    }
+    catch(const std::invalid_argument &)
+    {
+        return false;
+    }
+    catch(const std::out_of_range &)
+    {
+        return false;
+    }
+
+    constexpr int gibibyte_shift = 30;
+    const double limit = std::ldexp(
+        1.0, std::numeric_limits<unsigned long long>::digits - gibibyte_shift);
+    if(!(gibibytes >= 0 && gibibytes < limit) ||
+       value.find_first_not_of(" \t\n\r\f\v", consumed) != std::string::npos)
+        return false;
+
+    bytes = static_cast<unsigned long long>(std::ldexp(gibibytes, gibibyte_shift));
+    return true;
+}
+
 bool getSubInfoFromSSD(const std::string &sub, std::string &result)
 {
     rapidjson::Document json;
@@ -186,13 +242,16 @@ bool getSubInfoFromSSD(const std::string &sub, std::string &result)
     if(json.HasParseError())
         return false;
 
-    std::string used_str = GetMember(json, "traffic_used"), total_str = GetMember(json, "traffic_total"), expire_str = GetMember(json, "expiry");
-    if(used_str.empty() || total_str.empty())
+    unsigned long long used, total;
+    if(!parseSSDTrafficBytes(GetMember(json, "traffic_used"), used) ||
+       !parseSSDTrafficBytes(GetMember(json, "traffic_total"), total))
         return false;
-    unsigned long long used = stod(used_str) * std::pow(1024, 3), total = stod(total_str) * std::pow(1024, 3), expire;
     result = "upload=0; download=" + std::to_string(used) + "; total=" + std::to_string(total) + ";";
 
-    expire = dateStringToTimestamp(regReplace(expire_str, "(\\d+)-(\\d+)-(\\d+) (.*)", "$1:$2:$3:$4"));
+    const std::string expire_str = GetMember(json, "expiry");
+    unsigned long long expire = dateStringToTimestamp(regReplace(
+        expire_str, R"(^(\d+)-(\d+)-(\d+) (\d+):(\d+)(?::(\d+))?$)",
+        "$1:$2:$3:$4:$5:${6:-00}"));
     if(expire)
         result += " expire=" + std::to_string(expire) + ";";
 

@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       GH_TOKEN: ${{ github.token }}
@@ -79,7 +79,6 @@ jobs:
           SHA: ${{ steps.identity.outputs.revision }}
           VERSION: ${{ env.RELEASE_TAG }}
           BUILD_DATE: ${{ steps.identity.outputs.created }}
-          BUILD_TESTS: 'false'
         run: |
           set -euo pipefail
           {
