@@ -23,7 +23,7 @@ concurrency:
 jobs:
   manage:
     name: 检查不活跃 Issue / Check inactive issues
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       INACTIVE_ISSUE_WAIT_DAYS: "30"
