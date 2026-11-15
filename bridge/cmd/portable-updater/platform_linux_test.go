@@ -113,7 +113,7 @@ func TestLinuxExchangeChild(t *testing.T) {
 	testIdentity(t, u.root, old)
 	testIdentity(t, right, next)
 	err := atomicSwapDirectories(u.root, right)
-	supportedFallback := number == int(unix.EINVAL) || number == int(unix.ENOSYS) || number == int(unix.EOPNOTSUPP)
+	supportedFallback := number == uint64(unix.EINVAL) || number == uint64(unix.ENOSYS) || number == uint64(unix.EOPNOTSUPP)
 	if number != 0 && !supportedFallback {
 		if !errors.Is(err, unix.Errno(number)) || errors.Is(err, errSwapIncomplete) {
 			t.Fatalf("unexpected error: %v", err)
