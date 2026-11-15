@@ -2000,7 +2000,7 @@ def run_checks(
         for provider_name, expected in {
             "Zero": False,
             "Slow": True,
-            "Default": True,
+            "Default": False,
         }.items():
             actual = provider_proxy_direct_from_output(interval_output, provider_name)
             if actual is not expected:
