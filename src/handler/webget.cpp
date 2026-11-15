@@ -3861,7 +3861,8 @@ static std::string dataGet(const std::string &url)
             if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
             return -1;
         };
-        for (size_t read = comma + 1; read < url.size(); ++read) {
+        size_t read = comma + 1;
+        while (read < url.size()) {
             if (url[read] == '%' && url.size() - read >= 3) {
                 const int high = hex_digit(url[read + 1]);
                 const int low = hex_digit(url[read + 2]);
@@ -3869,12 +3870,13 @@ static std::string dataGet(const std::string &url)
                     const char decoded = static_cast<char>(high * 16 + low);
                     if (!base64 || (decoded != '\r' && decoded != '\n'))
                         data.push_back(decoded);
-                    read += 2;
+                    read += 3;
                     continue;
                 }
             }
             if (!base64 || (url[read] != '\r' && url[read] != '\n'))
                 data.push_back(url[read]);
+            ++read;
         }
     }
     const long max_download_size = effectiveSettings().maxAllowedDownloadSize;

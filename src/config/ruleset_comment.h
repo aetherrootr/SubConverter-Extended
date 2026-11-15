@@ -87,9 +87,10 @@ inline void stripAt(std::string &line, size_t slash, bool raw_value)
         else if(c == '/' && line[i + 1] == '/' && i > first &&
                 isSpace(line[i - 1]))
         {
-            while(i && isSpace(line[i - 1]))
-                --i;
-            line.erase(i);
+            size_t comment_begin = i;
+            while(comment_begin && isSpace(line[comment_begin - 1]))
+                --comment_begin;
+            line.erase(comment_begin);
             return;
         }
     }

@@ -573,20 +573,20 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
                    "NODE_PARSER_FAILED parser=mihomo branch=direct reason=no_nodes");
           return -1;
         }
-        for (auto &node : parsed_nodes) {
+        for (auto &parsed_node : parsed_nodes) {
           if (explicit_http_node) {
-            auto canonical = nlohmann::json::parse(node.CanonicalProxyJson);
+            auto canonical = nlohmann::json::parse(parsed_node.CanonicalProxyJson);
             if (canonical.value("type", std::string()) != "http")
               return -1;
             canonical["skip-cert-verify"] =
                 parse_set.explicit_http_skip_cert_verify;
-            node.CanonicalProxyJson = canonical.dump();
-            node.AllowInsecure = parse_set.explicit_http_skip_cert_verify;
+            parsed_node.CanonicalProxyJson = canonical.dump();
+            parsed_node.AllowInsecure = parse_set.explicit_http_skip_cert_verify;
           }
-          node.GroupId = groupID;
+          parsed_node.GroupId = groupID;
           if (!custom_group.empty())
-            node.Group = custom_group;
-          allNodes.emplace_back(std::move(node));
+            parsed_node.Group = custom_group;
+          allNodes.emplace_back(std::move(parsed_node));
         }
       } catch (const BoundedOutputExceeded &) {
         throw;

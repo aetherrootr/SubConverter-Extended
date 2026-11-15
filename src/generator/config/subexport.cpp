@@ -685,6 +685,50 @@ static bool surgeProxyScalarIsSafe(const std::string &value) {
   return value.find_first_of(",\r\n") == std::string::npos;
 }
 
+static bool surgeSnellSettingsAreSupported(const Proxy &x, int surge_ver,
+                                           uint16_t snell_version) {
+  if (surge_ver < 3 || snell_version > 6 || x.Password.empty())
+    return false;
+  if (!x.SnellUserKey.empty() || !x.SnellNetwork.empty())
+    return false;
+
+  // Snell 6 uses its own transport; earlier versions allow selected obfuscation.
+  if (snell_version == 6 &&
+      (!x.OBFS.empty() || !x.Host.empty() || !x.Path.empty()))
+    return false;
+  if (!x.OBFS.empty() && x.OBFS != "http" && x.OBFS != "tls" &&
+      x.OBFS != "shadow-tls")
+    return false;
+  if (snell_version >= 4 && x.OBFS == "tls")
+    return false;
+  if (!x.Path.empty() && x.OBFS != "http")
+    return false;
+  if (x.SnellUDPPort != 0 && snell_version < 3)
+    return false;
+  if (snell_version == 6) {
+    if (!x.SnellMode.empty() && x.SnellMode != "default" &&
+        x.SnellMode != "unshaped" && x.SnellMode != "unsafe-raw")
+      return false;
+  } else if (!x.SnellMode.empty()) {
+    return false;
+  }
+
+  // Partial ShadowTLS credentials or incompatible transport versions are invalid.
+  const bool has_shadow_tls = !x.ShadowTLSPassword.empty() ||
+      !x.ShadowTLSSNI.empty() || x.ShadowTLSVersion != 0;
+  if (has_shadow_tls) {
+    if (x.ShadowTLSPassword.empty() ||
+        (!x.OBFS.empty() && x.OBFS != "shadow-tls"))
+      return false;
+    if (x.ShadowTLSVersion != 0 && x.ShadowTLSVersion != 2 &&
+        x.ShadowTLSVersion != 3)
+      return false;
+    if (x.ShadowTLSVersion == 3 && x.ShadowTLSSNI.empty())
+      return false;
+  }
+  return true;
+}
+
 static bool quanxProxyScalarIsSafe(const std::string &value) {
   if (value.empty())
     return true;
@@ -1609,30 +1653,10 @@ static void proxyToClashImpl(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
   used_remarks.reserve(nodes.size());
   /// proxies style
 
-  bool proxy_block = false, proxy_compact = false, group_block = false,
-       group_compact = false;
-  switch (hash_(ext.clash_proxies_style)) {
-  case "block"_hash:
-    proxy_block = true;
-    break;
-  default:
-  case "flow"_hash:
-    break;
-  case "compact"_hash:
-    proxy_compact = true;
-    break;
-  }
-  switch (hash_(ext.clash_proxy_groups_style)) {
-  case "block"_hash:
-    group_block = true;
-    break;
-  default:
-  case "flow"_hash:
-    break;
-  case "compact"_hash:
-    group_compact = true;
-    break;
-  }
+  const bool proxy_block = ext.clash_proxies_style == "block";
+  const bool proxy_compact = ext.clash_proxies_style == "compact";
+  const bool group_block = ext.clash_proxy_groups_style == "block";
+  const bool group_compact = ext.clash_proxy_groups_style == "compact";
 
   for (Proxy &x : nodes) {
     YAML::Node singleproxy;
@@ -4726,35 +4750,18 @@ std::string proxyToSurge(std::vector<Proxy> &nodes,
     case ProxyType::Snell: {
       const uint16_t snell_version =
           x.SnellVersion == 0 ? 1 : x.SnellVersion;
-      if (surge_ver < 3 || snell_version > 6 ||
-          x.Password.empty() ||
-          !x.SnellUserKey.empty() || !x.SnellNetwork.empty() ||
-          (snell_version == 6 &&
-           (!x.OBFS.empty() || !x.Host.empty() || !x.Path.empty())) ||
-          (!x.OBFS.empty() && x.OBFS != "http" &&
-           x.OBFS != "tls" && x.OBFS != "shadow-tls") ||
-          (snell_version >= 4 && x.OBFS == "tls") ||
-          (!x.Path.empty() && x.OBFS != "http") ||
-          (x.SnellUDPPort != 0 && snell_version < 3) ||
-          (snell_version == 6
-               ? (!x.SnellMode.empty() && x.SnellMode != "default" &&
-                  x.SnellMode != "unshaped" &&
-                  x.SnellMode != "unsafe-raw")
-               : !x.SnellMode.empty()) ||
-          ((!x.ShadowTLSPassword.empty() || !x.ShadowTLSSNI.empty() ||
-            x.ShadowTLSVersion != 0) &&
-           (x.ShadowTLSPassword.empty() ||
-            (!x.OBFS.empty() && x.OBFS != "shadow-tls") ||
-            (x.ShadowTLSVersion != 0 && x.ShadowTLSVersion != 2 &&
-             x.ShadowTLSVersion != 3) ||
-            (x.ShadowTLSVersion == 3 && x.ShadowTLSSNI.empty()))) ||
-          !surgeProxyScalarIsSafe(hostname) ||
-          !surgeProxyScalarIsSafe(password) ||
-          !surgeProxyScalarIsSafe(obfs) ||
-          !surgeProxyScalarIsSafe(host) ||
-          !surgeProxyScalarIsSafe(path) ||
-          !surgeProxyScalarIsSafe(x.ShadowTLSPassword) ||
-          !surgeProxyScalarIsSafe(x.ShadowTLSSNI)) {
+      if (!surgeSnellSettingsAreSupported(x, surge_ver, snell_version)) {
+        supported = false;
+        break;
+      }
+      const bool safe_endpoint = surgeProxyScalarIsSafe(hostname) &&
+          surgeProxyScalarIsSafe(password);
+      const bool safe_obfs = safe_endpoint && surgeProxyScalarIsSafe(obfs) &&
+          surgeProxyScalarIsSafe(host) && surgeProxyScalarIsSafe(path);
+      const bool safe_shadow_tls = safe_obfs &&
+          surgeProxyScalarIsSafe(x.ShadowTLSPassword) &&
+          surgeProxyScalarIsSafe(x.ShadowTLSSNI);
+      if (!safe_shadow_tls) {
         supported = false;
         break;
       }

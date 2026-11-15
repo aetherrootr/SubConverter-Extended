@@ -630,6 +630,7 @@ ClashHealthDefaultsByName collectClashHealthDefaults(
   if (groups.size() > std::numeric_limits<size_t>::max() / record_bytes)
     throw BoundedOutputExceeded();
   reserveBoundedOutputBytes(groups.size() * record_bytes);
+  // Retain defaults only for groups requested by the external configuration.
   std::unordered_set<std::string_view> requested;
   requested.reserve(groups.size());
   for (const ProxyGroupConfig &group : groups)
@@ -650,6 +651,7 @@ ClashHealthDefaultsByName collectClashHealthDefaults(
     if (requested_name == requested.end())
       continue;
     auto found = result.find(*requested_name);
+    // Duplicate base names cannot provide an unambiguous health-check policy.
     if (found != result.end()) {
       found->second.ambiguous = true;
       ignored = true;
@@ -664,6 +666,7 @@ ClashHealthDefaultsByName collectClashHealthDefaults(
           copied_bytes, fields.values[1].Scalar().size(),
           std::numeric_limits<size_t>::max());
       std::array<size_t, 3> order{0, 1, 2};
+      // Preserve the source order when scalar decoding depends on its spelling.
       if (source.encoded()) {
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
           return fields.values[a + 2].Mark().pos < fields.values[b + 2].Mark().pos;
@@ -692,6 +695,7 @@ ClashHealthDefaultsByName collectClashHealthDefaults(
       ignored = true;
     }
     reserveBoundedOutputBytes(copied_bytes);
+    // Commit the validated scalar snapshot after reserving its memory budget.
     auto inserted = result.emplace(*requested_name, ClashHealthDefaults{}).first;
     ClashHealthDefaults &defaults = inserted->second;
     defaults.ambiguous = !valid_identity;
