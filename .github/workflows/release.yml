@@ -79,7 +79,6 @@ jobs:
           SHA: ${{ steps.identity.outputs.revision }}
           VERSION: ${{ env.RELEASE_TAG }}
           BUILD_DATE: ${{ steps.identity.outputs.created }}
-          BUILD_TESTS: 'false'
         run: |
           set -euo pipefail
           {

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -8,6 +9,7 @@
 #include <numeric>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -16,6 +18,7 @@
 #include "external_rules.h"
 #include "generator/config/clash_proxy.h"
 #include "generator/config/clash_health_check.h"
+#include "generator/config/clash_group_defaults.h"
 #include "generator/config/subexport.h"
 #include "generator/template/templates.h"
 #include "handler/settings.h"
@@ -27,7 +30,8 @@
 #include "script/script_quickjs.h"
 #include "utils/bitwise.h"
 #include "utils/bounded_output.h"
-#include "utils/file_extra.h"
+#include "utils/base64/base64.h"
+#include "utils/file.h"
 #include "utils/ini_reader/ini_reader.h"
 #include "utils/logger.h"
 #include "utils/network.h"
@@ -163,13 +167,334 @@ static bool splitRenameGroupRule(const std::string &match,
   return true;
 }
 
+static bool providerEmojiPattern(const std::string &pattern,
+                                std::string &converted) {
+  // Search uses PCRE2_UTF without UCP. regexp2's shorthand classes and word
+  // boundaries are Unicode by default, so spell out the server's ASCII sets.
+  auto shorthand = [](char code) -> std::string {
+    switch (code) {
+    case 'd':
+      return "[0-9]";
+    case 'D':
+      return "[^0-9]";
+    case 's':
+      return R"([\x09-\x0D\x20])";
+    case 'S':
+      return R"([^\x09-\x0D\x20])";
+    case 'w':
+      return "(?-i:[A-Za-z0-9_])";
+    case 'W':
+      return "(?-i:[^A-Za-z0-9_])";
+    case 'b':
+      return "(?-i:(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])|"
+             "(?<=[A-Za-z0-9_])(?![A-Za-z0-9_]))";
+    case 'B':
+      return "(?-i:(?<=[A-Za-z0-9_])(?=[A-Za-z0-9_])|"
+             "(?<![A-Za-z0-9_])(?![A-Za-z0-9_]))";
+    default:
+      return {};
+    }
+  };
+  // regexp2 lowercases input for IgnoreCase; PCRE uses Unicode simple folding.
+  // These ASCII letters differ (long s is folded, dotted capital I is not).
+  auto folded = [](char code) -> std::string {
+    if (code == 'i' || code == 'I')
+      return "(?-i:[Ii])";
+    if (code == 's' || code == 'S')
+      return R"((?-i:[Ss\x{17F}]))";
+    return {};
+  };
+  constexpr int extended = 1, caseless = 2;
+  int mode = 0;
+  std::vector<int> modes;
+  auto escape_argument = [&](char code, size_t &position, std::string &output) {
+    if (position >= pattern.size())
+      return;
+    if (code == 'c' ||
+        ((code == 'p' || code == 'P') && pattern[position] != '{')) {
+      output += pattern[position++];
+    } else if ((code == 'k' &&
+                (pattern[position] == '<' || pattern[position] == '\'')) ||
+               ((code == 'p' || code == 'P') && pattern[position] == '{')) {
+      const char close = pattern[position] == '<' ? '>' :
+                         pattern[position] == '{' ? '}' : '\'';
+      const size_t end = pattern.find(close, position + 1);
+      output += pattern.substr(position, end - position + 1);
+      position = end + 1;
+    }
+  };
+  for (size_t i = 0; i < pattern.size();) {
+    const char ch = pattern[i++];
+    if (ch == '\\' && i < pattern.size()) {
+      const char code = pattern[i++];
+      if (std::string("CEhHKNoQRvVX").find(code) != std::string::npos)
+        return false;
+      const auto replacement = shorthand(code);
+      converted += replacement.empty() ? std::string("\\") + code : replacement;
+      escape_argument(code, i, converted);
+    } else if (ch == '[') {
+      const size_t start = i - 1;
+      const bool negate = i < pattern.size() && pattern[i] == '^';
+      if (negate)
+        ++i;
+      std::string literal, alternatives;
+      bool first = true, changed = false;
+      auto flush = [&] {
+        if (!literal.empty()) {
+          alternatives += "[" + literal + "]|";
+          literal.clear();
+        }
+      };
+      for (; i < pattern.size(); first = false) {
+        char item = pattern[i++];
+        if (item == ']' && !first)
+          break;
+        if (item == '\\' && i < pattern.size()) {
+          const char code = pattern[i++];
+          if (std::string("CEhHKNoQRvVX").find(code) != std::string::npos)
+            return false;
+          const auto replacement =
+              (code == 'b' || code == 'B') ? std::string() : shorthand(code);
+          if (!replacement.empty()) {
+            flush();
+            alternatives += replacement + "|";
+            changed = true;
+            continue;
+          }
+          literal += std::string("\\") + code;
+          escape_argument(code, i, literal);
+        } else {
+          // POSIX classes and .NET class subtraction have different meanings.
+          if (item == '[' && i < pattern.size() &&
+              (pattern[i] == ':' || (i > start + 2 && pattern[i - 2] == '-')))
+            return false;
+          // Caseless letter ranges have further Unicode folding differences.
+          // Withhold these rather than grow this adapter into a regex compiler.
+          if ((mode & caseless) && item == '-' && !first &&
+              i < pattern.size() && pattern[i] != ']' &&
+              !(pattern[i - 2] >= '0' && pattern[i - 2] <= '9' &&
+                pattern[i] >= '0' && pattern[i] <= '9'))
+            return false;
+          const auto replacement = (mode & caseless) ? folded(item) : "";
+          if (!replacement.empty()) {
+            flush();
+            alternatives += replacement + "|";
+            changed = true;
+            continue;
+          }
+          if (item == ']' || item == '^' || item == '[')
+            literal += '\\';
+          literal += item;
+        }
+      }
+      if (!changed) {
+        converted += pattern.substr(start, i - start);
+      } else {
+        // Keep each shorthand separate: case folding an ASCII \w inside a
+        // larger class would admit Unicode characters such as the Kelvin sign.
+        flush();
+        alternatives.pop_back();
+        converted += negate ? "(?!(?:" + alternatives + "))[\\s\\S]"
+                            : "(?:" + alternatives + ")";
+      }
+    } else if (ch == '#' && (mode & extended)) {
+      const size_t end = pattern.find('\n', i);
+      converted += pattern.substr(
+          i - 1, end == std::string::npos ? end : end - i + 1);
+      i = end == std::string::npos ? pattern.size() : end;
+    } else if (ch == '(') {
+      if (i < pattern.size() && pattern[i] == '*')
+        return false;
+      if (pattern.compare(i, 2, "?#") == 0) {
+        const size_t end = pattern.find(')', i + 2);
+        converted += pattern.substr(i - 1, end - i + 2);
+        i = end + 1;
+        continue;
+      }
+      if (pattern.compare(i, 2, "?P") == 0)
+        return false;
+      if ((pattern.compare(i, 2, "?<") == 0 && i + 2 < pattern.size() &&
+           pattern[i + 2] != '=' && pattern[i + 2] != '!') ||
+          pattern.compare(i, 2, "?'") == 0) {
+        const size_t end = pattern.find(pattern[i + 1] == '<' ? '>' : '\'', i + 2);
+        modes.push_back(mode);
+        converted += pattern.substr(i - 1, end - i + 2);
+        i = end + 1;
+        continue;
+      }
+      size_t end = i;
+      int next = mode;
+      bool enable = true;
+      if (end < pattern.size() && pattern[end] == '?') {
+        for (++end; end < pattern.size(); ++end) {
+          const char option = pattern[end];
+          if (option == '-')
+            enable = false;
+          else if (option == 'x' || option == 'i') {
+            const int flag = option == 'x' ? extended : caseless;
+            next = enable ? next | flag : next & ~flag;
+          } else if (option != 'm' && option != 'n' && option != 's')
+            break;
+        }
+        if (end < pattern.size() && pattern[end] != ':' && pattern[end] != ')' &&
+            (end > i + 1 ||
+             std::string("=!<>").find(pattern[end]) == std::string::npos))
+          return false;
+      }
+      if (end > i + 1 && end < pattern.size() &&
+          (pattern[end] == ':' || pattern[end] == ')')) {
+        if (pattern[end] == ':')
+          modes.push_back(mode);
+        mode = next;
+        converted += pattern.substr(i - 1, end - i + 2);
+        i = end + 1;
+      } else {
+        modes.push_back(mode);
+        converted += ch;
+      }
+    } else {
+      if ((ch == '*' || ch == '+' || ch == '?') &&
+          i < pattern.size() && pattern[i] == '+')
+        return false;
+      if (ch == ')' && !modes.empty()) {
+        mode = modes.back();
+        modes.pop_back();
+      }
+      const auto replacement = (mode & caseless) ? folded(ch) : "";
+      converted += replacement.empty() ? std::string(1, ch) : replacement;
+    }
+  }
+  return true;
+}
+
+static void appendProviderEmojiOverrides(YAML::Node &overrides,
+                                        const ProxyProvider &provider,
+                                        const extra_settings &ext) {
+  RegexMatchConfigs rules;
+  std::vector<std::string> patterns;
+  Proxy source;
+  source.Group = provider.tag;
+  source.GroupId = provider.groupId;
+  for (const RegexMatchConfig &rule : ext.emoji_array) {
+    std::string pattern = rule.Match;
+    bool unsupported = !rule.Script.empty() && ext.authorized;
+    if (!unsupported && (pattern.empty() || rule.Replace.empty()))
+      continue;
+    if (!unsupported && (startsWith(pattern, "!!GROUP=") ||
+                         startsWith(pattern, "!!GROUPID=") ||
+                         startsWith(pattern, "!!INSERT="))) {
+      if (!applyMatcher(rule.Match, pattern, source) || pattern.empty())
+        continue;
+    } else if (!unsupported && startsWith(pattern, "!!")) {
+      unsupported = true;
+    }
+    if (!unsupported && !CompiledRegex(pattern, CompiledRegexMode::Search).valid())
+      continue;
+    // Combining independent expressions changes numbered capture references.
+    // Extended-mode line comments can also consume the generated closing groups.
+    // Withhold the complete addition rather than change first-match priority.
+    unsupported = unsupported ||
+                  regFind(pattern,
+                          R"((?:^|[^\\])(?:\\\\)*\\(?:[1-9]|g|k[<'][0-9])|)"
+                          R"(\(\?\(|\(\?[imnsx-]*x[imnsx-]*\))");
+    std::string converted;
+    unsupported = unsupported || !providerEmojiPattern(pattern, converted);
+    if (unsupported) {
+      writeLog(LOG_LEVEL_WARNING,
+               "PROVIDER_EMOJI_UNSUPPORTED: emoji addition requires name "
+               "regexes without scripts, node-property conditions, numbered "
+               "references, conditionals, unscoped extended mode or "
+               "caseless character ranges or PCRE-only syntax; "
+               "addition skipped");
+      return;
+    }
+    rules.push_back({pattern, rule.Replace, ""});
+    patterns.push_back(std::move(converted));
+  }
+  if (rules.empty())
+    return;
+
+  std::string capture_prefix = "sce_emoji_";
+  while (std::any_of(rules.begin(), rules.end(), [&](const auto &rule) {
+    return rule.Match.find(capture_prefix) != std::string::npos;
+  }))
+    capture_prefix += "_";
+
+  // Encode every nonempty name before decoding it. Two distinct separator
+  // characters make the single captured first rune identify its branch even
+  // when the original name contains our header or separators. No-match names
+  // are restored last. Decoded emoji names cannot start with this space-free
+  // header, so subsequent decoding rules cannot modify them a second time.
+  std::string header;
+  for (size_t index = 0;; ++index) {
+    header = "SCE" + std::to_string(index) + ":";
+    if (std::none_of(rules.begin(), rules.end(), [&](const auto &rule) {
+          return startsWith(rule.Replace + " ", header);
+        }))
+      break;
+  }
+  auto append = [&](const std::string &pattern, const std::string &target) {
+    YAML::Node item;
+    item["pattern"] = pattern;
+    item["target"] = target;
+    overrides.push_back(item);
+  };
+  auto search = [](const std::string &pattern) {
+    return R"([\s\S]*?(?m:(?:)" + pattern + "))";
+  };
+  const std::string name = capture_prefix + "name";
+  std::string selector = "\\A(?<" + name + ">(?:";
+  std::string target = header;
+  for (size_t index = 0; index < rules.size(); ++index) {
+    const std::string slot = capture_prefix + std::to_string(index);
+    if (index)
+      selector += "|";
+    selector += "(?=" + search(patterns[index]) + ")(?<" + slot +
+                ">[\\s\\S])";
+    target += ":_${" + slot + "}";
+  }
+  selector += R"(|[\s\S])[\s\S]*)\z)";
+  append(selector, target + ":_${" + name + "}");
+  for (size_t index = 0; index < rules.size(); ++index) {
+    append("\\A" + header + "(?::_){" + std::to_string(index + 1) +
+               R"(}[\s\S](?::_){)" + std::to_string(rules.size() - index) +
+               "}(?<" + name + R"(>[\s\S]*)\z)",
+           replaceAllDistinct(rules[index].Replace, "$", "$$") + " ${" +
+               name + "}");
+  }
+  append("\\A" + header + "(?::_){" + std::to_string(rules.size() + 1) +
+             "}(?<" + name + R"(>[\s\S]*)\z)",
+         "${" + name + "}");
+  // Empty names have no rune to encode. Their first match is independent of
+  // provider contents, so resolve it once using the server's own regex engine.
+  const auto empty_name = std::find_if(rules.begin(), rules.end(),
+                                     [](const auto &rule) {
+                                       return regFind("", rule.Match);
+                                     });
+  if (empty_name != rules.end())
+    append(R"(\A\z)", replaceAllDistinct(empty_name->Replace, "$", "$$") + " ");
+}
+
 static YAML::Node buildProviderProxyNameOverride(const ProxyProvider &provider,
                                                  const extra_settings &ext) {
   YAML::Node proxy_name_node(YAML::NodeType::Sequence);
-  if (!ext.rename_for_providers || ext.rename_array.empty())
-    return proxy_name_node;
+  if (ext.provider_emoji_enabled && ext.remove_emoji) {
+    YAML::Node remove;
+    // Match removeEmoji's UTF-8 F0 9F range and preserve all-emoji names.
+    remove["pattern"] =
+        R"(\A[\x{1F000}-\x{1FFFF}]+(?=[^\x{1F000}-\x{1FFFF}]))";
+    remove["target"] = "";
+    proxy_name_node.push_back(remove);
+    YAML::Node spaces;
+    // trim() removes ASCII spaces but deliberately preserves all-space names.
+    spaces["pattern"] = R"(\A +(?=[^ ])|(?<=[^ ]) +\z)";
+    spaces["target"] = "";
+    proxy_name_node.push_back(spaces);
+  }
 
   for (const RegexMatchConfig &rule : ext.rename_array) {
+    if (!ext.rename_for_providers)
+      break;
     if (!rule.Script.empty() || rule.Match.empty())
       continue;
 
@@ -194,6 +519,9 @@ static YAML::Node buildProviderProxyNameOverride(const ProxyProvider &provider,
     item["target"] = rule.Replace;
     proxy_name_node.push_back(item);
   }
+
+  if (ext.provider_emoji_enabled && ext.add_emoji)
+    appendProviderEmojiOverrides(proxy_name_node, provider, ext);
 
   return proxy_name_node;
 }
@@ -1095,7 +1423,7 @@ static YAML::Node providersMatchingGroupId(
   YAML::Node use_node(YAML::NodeType::Sequence);
   for (const ProxyProvider &p : providers) {
     if (p.groupId >= 0 && matchRange(target, p.groupId))
-      use_node.push_back(p.name);
+      use_node[use_node.size()] = p.name;
   }
   return use_node;
 }
@@ -1105,7 +1433,7 @@ static YAML::Node providersMatchingGroupTag(
   YAML::Node use_node(YAML::NodeType::Sequence);
   for (const ProxyProvider &p : providers) {
     if (!p.tag.empty() && regFind(p.tag, target))
-      use_node.push_back(p.name);
+      use_node[use_node.size()] = p.name;
   }
   return use_node;
 }
@@ -1248,9 +1576,33 @@ void groupGenerate(const std::string &rule, std::vector<Proxy> &nodelist,
   }
 }
 
-void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
+namespace {
+
+template <typename Integer>
+void setClashInteger(YAML::Node slot, Integer value) {
+  static_assert(std::is_integral_v<Integer> && !std::is_same_v<Integer, bool>);
+  slot = std::to_string(value);
+}
+
+void setClashBoolean(YAML::Node slot, bool value) {
+  slot = std::string(value ? "true" : "false");
+}
+
+void fillClashStringSequence(YAML::Node target, const string_array &values) {
+  for (size_t index = 0; index < values.size(); ++index)
+    target[index] = values[index];
+}
+
+} // namespace
+
+static void proxyToClashImpl(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
                   const ProxyGroupConfigs &extra_proxy_group, bool clashR,
-                  extra_settings &ext) {
+                  extra_settings &ext, std::string_view base_source) {
+  const char *groups_field = ext.clash_new_field_name
+      ? "proxy-groups" : "Proxy Group";
+  const ClashHealthDefaultsByName health_defaults =
+      ext.nodelist ? ClashHealthDefaultsByName{} :
+          collectClashHealthDefaults(yamlnode, extra_proxy_group, groups_field, base_source);
   YAML::Node proxies, original_groups;
   std::vector<Proxy> nodelist;
   RemarkSet used_remarks;
@@ -1885,12 +2237,14 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
     YAML::Node provider_node;
 
     for (const ProxyProvider &p : ext.providers) {
-      YAML::Node single_provider;
-      single_provider["type"] = "http";
+      YAML::Node single_provider = provider_node[p.name];
+      if (single_provider.IsDefined())
+        single_provider = YAML::Node();
+      single_provider["type"] = std::string("http");
       single_provider["url"] = p.url;
-      single_provider["interval"] = p.interval;
+      setClashInteger(single_provider["interval"], p.interval);
       if (p.proxy_direct)
-        single_provider["proxy"] = "DIRECT";
+        single_provider["proxy"] = std::string("DIRECT");
       single_provider["path"] = p.path;
 
       // 添加过滤器
@@ -1902,17 +2256,21 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
       }
 
       if (!p.user_agent.empty()) {
-        single_provider["header"]["User-Agent"].push_back(p.user_agent);
+        YAML::Node header = single_provider["header"]["User-Agent"];
+        header[header.size()] = p.user_agent;
+        if (p.user_agent_explicit)
+          header[header.size() - 1].SetTag("tag:yaml.org,2002:str");
       }
       for (const auto &[name, value] : p.headers) {
-        single_provider["header"][name].push_back(value);
+        YAML::Node header = single_provider["header"][name];
+        header[header.size()] = value;
       }
 
       // 健康检查配置
-      single_provider["health-check"]["enable"] = true;
-      single_provider["health-check"]["url"] =
-          "https://www.gstatic.com/generate_204";
-      single_provider["health-check"]["interval"] = 300;
+      YAML::Node health_check = single_provider["health-check"];
+      setClashBoolean(health_check["enable"], true);
+      health_check["url"] = std::string("https://www.gstatic.com/generate_204");
+      setClashInteger(health_check["interval"], 300);
 
       preserveClashProviderHealthCheck(
           single_provider,
@@ -1941,8 +2299,6 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
       if (has_override) {
         single_provider["override"] = override_node;
       }
-
-      provider_node[p.name] = single_provider;
     }
 
     yamlnode["proxy-providers"] = provider_node;
@@ -1951,13 +2307,39 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
                  " 个 proxy provider。");
   }
 
+  std::unordered_set<std::string_view> emitted_group_names;
+  if (extra_proxy_group.size() > 1) {
+    constexpr size_t name_bytes = sizeof(std::string_view) + 128;
+    if (extra_proxy_group.size() >
+        std::numeric_limits<size_t>::max() / name_bytes)
+      throw BoundedOutputExceeded();
+    reserveBoundedOutputBytes(extra_proxy_group.size() * name_bytes);
+    emitted_group_names.reserve(extra_proxy_group.size());
+  }
   for (const ProxyGroupConfig &x : extra_proxy_group) {
-    YAML::Node singlegroup;
+    // Unsupported types had no observable side effects before the old switch.
+    switch (x.Type) {
+    case ProxyGroupType::Select:
+    case ProxyGroupType::Relay:
+    case ProxyGroupType::LoadBalance:
+    case ProxyGroupType::Smart:
+    case ProxyGroupType::URLTest:
+    case ProxyGroupType::Fallback:
+      break;
+    default:
+      continue;
+    }
+    const bool first = extra_proxy_group.size() == 1 ||
+        emitted_group_names.emplace(x.Name).second;
+    // All emitted groups share one arena. A duplicate still executes the
+    // complete generation path, but its temporary result is discarded.
+    YAML::Node singlegroup = first
+        ? original_groups[original_groups.size()] : YAML::Node();
     string_array filtered_nodelist;
 
     singlegroup["name"] = x.Name;
     if (x.Type == ProxyGroupType::Smart)
-      singlegroup["type"] = "url-test";
+      singlegroup["type"] = std::string("url-test");
     else
       singlegroup["type"] = x.TypeStr();
 
@@ -1979,15 +2361,15 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
       applyClashGroupHealthCheck(singlegroup, x);
       singlegroup["url"] = x.Url;
       if (x.Interval > 0)
-        singlegroup["interval"] = x.Interval;
+        setClashInteger(singlegroup["interval"], x.Interval);
       if (x.Tolerance > 0)
-        singlegroup["tolerance"] = x.Tolerance;
+        setClashInteger(singlegroup["tolerance"], x.Tolerance);
       break;
     default:
       continue;
     }
     if (!x.DisableUdp.is_undef())
-      singlegroup["disable-udp"] = x.DisableUdp.get();
+      setClashBoolean(singlegroup["disable-udp"], x.DisableUdp.get());
 
     for (const auto &y : x.Proxies)
       groupGenerate(y, nodelist, filtered_nodelist, true, ext);
@@ -1998,11 +2380,20 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
       bool has_regex = false;
       std::string regex_pattern;
       bool has_provider_match = false;
-      YAML::Node provider_use_node(YAML::NodeType::Sequence);
+      YAML::Node provider_use_node;
 
       for (const auto &proxy : x.Proxies) {
         // 如果不是以 [] 开头，则认为是正则表达式
         if (isProviderRegexRule(proxy)) {
+          // Only ordinary regexes reach the next iteration. Keep later
+          // selectors/scripts out of the filter and preserve regex order.
+          if (has_regex) {
+            if (!startsWith(proxy, "!!") && !startsWith(proxy, "script:")) {
+              regex_pattern += '`';
+              regex_pattern += proxy;
+            }
+            continue;
+          }
           std::string groupid_target, groupid_filter;
           if (parseProviderGroupIdMatcher(proxy, groupid_target,
                                           groupid_filter)) {
@@ -2032,7 +2423,9 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
 
           has_regex = true;
           regex_pattern = proxy;
-          break; // 找到第一个正则就够了
+          // Preserve the first-rule behavior of special or unresolved rules.
+          if (startsWith(proxy, "!!") || startsWith(proxy, "script:"))
+            break;
         }
       }
 
@@ -2044,47 +2437,37 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
         // 只有包含正则表达式的策略组才引用 provider
         // 不包含正则的策略组只引用其他策略组，不需要 provider
         // 添加 use 字段引用所有原始 provider
-        YAML::Node use_node(YAML::NodeType::Sequence);
+        YAML::Node use_node = singlegroup["use"];
         for (const ProxyProvider &p : ext.providers) {
           // groupId >= 0 表示这是原始订阅的 provider
           if (p.groupId >= 0) {
-            use_node.push_back(p.name);
+            use_node[use_node.size()] = p.name;
           }
         }
-        if (use_node.size() > 0) {
-          singlegroup["use"] = use_node;
-        }
-
         // 添加 filter 字段
         singlegroup["filter"] = regex_pattern;
       }
     }
 
-    if (!x.UsingProvider.empty())
-      singlegroup["use"] = x.UsingProvider;
-    else {
+    if (!x.UsingProvider.empty()) {
+      YAML::Node use = singlegroup["use"];
+      if (use.IsDefined())
+        use = YAML::Node();
+      fillClashStringSequence(use, x.UsingProvider);
+    } else {
       // 在 proxy-provider 模式下，不自动添加 DIRECT
       // 策略组应该只引用 provider 或其他策略组
       if (filtered_nodelist.empty() && !ext.use_proxy_provider)
         filtered_nodelist.emplace_back("DIRECT");
     }
     if (!filtered_nodelist.empty())
-      singlegroup["proxies"] = filtered_nodelist;
+      fillClashStringSequence(singlegroup["proxies"], filtered_nodelist);
+    if (first && !health_defaults.empty())
+      applyClashHealthDefaults(singlegroup, health_defaults, x);
     if (group_block)
       singlegroup.SetStyle(YAML::EmitterStyle::Block);
     else
       singlegroup.SetStyle(YAML::EmitterStyle::Flow);
-
-    bool replace_flag = false;
-    for (auto &&original_group : original_groups) {
-      if (original_group["name"].as<std::string>() == x.Name) {
-        original_group.reset(singlegroup);
-        replace_flag = true;
-        break;
-      }
-    }
-    if (!replace_flag)
-      original_groups.push_back(singlegroup);
   }
   if (group_compact)
     original_groups.SetStyle(YAML::EmitterStyle::Flow);
@@ -2094,6 +2477,12 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
     yamlnode["proxy-groups"] = original_groups;
   else
     yamlnode["Proxy Group"] = original_groups;
+}
+
+void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
+                  const ProxyGroupConfigs &extra_proxy_group, bool clashR,
+                  extra_settings &ext) {
+  proxyToClashImpl(nodes, yamlnode, extra_proxy_group, clashR, ext, {});
 }
 
 std::string proxyToClash(std::vector<Proxy> &nodes,
@@ -2113,7 +2502,7 @@ std::string proxyToClash(std::vector<Proxy> &nodes,
     return "";
   }
 
-  proxyToClash(nodes, yamlnode, extra_proxy_group, clashR, ext);
+  proxyToClashImpl(nodes, yamlnode, extra_proxy_group, clashR, ext, base_conf);
 
   // 关键修复：在所有早期返回之前提取 proxy-providers
   // 这样所有返回路径都会使用正确的顺序
@@ -4337,7 +4726,7 @@ std::string proxyToSurge(std::vector<Proxy> &nodes,
     case ProxyType::Snell: {
       const uint16_t snell_version =
           x.SnellVersion == 0 ? 1 : x.SnellVersion;
-      if (surge_ver < 3 || surge_ver == -3 || snell_version > 6 ||
+      if (surge_ver < 3 || snell_version > 6 ||
           x.Password.empty() ||
           !x.SnellUserKey.empty() || !x.SnellNetwork.empty() ||
           (snell_version == 6 &&
@@ -5917,13 +6306,11 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini,
                 &pluginopts = x.PluginOption, &username = x.Username;
     std::string port = std::to_string(x.Port);
     bool &tlssecure = x.TLSSecure;
-    tribool scv;
+    tribool scv = ext.skip_cert_verify;
+    scv.define(x.AllowInsecure);
 
     switch (x.Type) {
     case ProxyType::VMess:
-      scv = ext.skip_cert_verify;
-      scv.define(x.AllowInsecure);
-
       if (method == "auto")
         method = "chacha20-ietf-poly1305";
       proxyStr = x.Remark + " = vmess, " + hostname + ", " + port + ", " +
@@ -6985,21 +7372,8 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini,
         filtered_nodelist = remarks_list;
     }
 
-    // don't process these for now
-    /*
-    proxy = vArray[1];
-    for(std::string &x : filtered_nodelist)
-        proxy += "," + x;
-    if(vArray[1] == "url-test" || vArray[1] == "fallback" || vArray[1] ==
-    "load-balance") proxy += ",url=" + url;
-    */
 
     proxy = x.Name + ", ";
-    /*
-    for(std::string &y : filtered_nodelist)
-        proxy += y + ":";
-    proxy = proxy.substr(0, proxy.size() - 1);
-    */
     proxy += join(filtered_nodelist, ":");
     proxy +=
         ", latency, interval=300, timeout=6"; // use hard-coded values for now
@@ -7814,11 +8188,7 @@ void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json,
   if (!ext.nodelist) {
     auto direct = buildObject(allocator, "type", "direct", "tag", "DIRECT");
     outbounds.PushBack(direct, allocator);
-    // 注释掉 REJECT 和 dns-out
-    // auto reject = buildObject(allocator, "type", "block", "tag", "REJECT");
-    // outbounds.PushBack(reject, allocator);
-    // auto dns = buildObject(allocator, "type", "dns", "tag", "dns-out");
-    // outbounds.PushBack(dns, allocator);
+    // REJECT 和 dns-out 不在这里生成出站。
   }
 
   for (Proxy &x : nodes) {
@@ -7858,22 +8228,7 @@ void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json,
       }
       break;
     }
-    //            case ProxyType::ShadowsocksR: {
-    //                addSingBoxCommonMembers(proxy, x, "shadowsocksr",
-    //                allocator); proxy.AddMember("method",
-    //                rapidjson::StringRef(x.EncryptMethod.c_str()), allocator);
-    //                proxy.AddMember("password",
-    //                rapidjson::StringRef(x.Password.c_str()), allocator);
-    //                proxy.AddMember("protocol",
-    //                rapidjson::StringRef(x.Protocol.c_str()), allocator);
-    //                proxy.AddMember("protocol_param",
-    //                rapidjson::StringRef(x.ProtocolParam.c_str()), allocator);
-    //                proxy.AddMember("obfs",
-    //                rapidjson::StringRef(x.OBFS.c_str()), allocator);
-    //                proxy.AddMember("obfs_param",
-    //                rapidjson::StringRef(x.OBFSParam.c_str()), allocator);
-    //                break;
-    //            }
+    // ShadowsocksR 不在当前 sing-box 出站生成范围内。
     case ProxyType::VMess: {
       if (!singBoxTransportSupported(x) ||
           (!x.PacketEncoding.empty() && x.PacketEncoding != "none" &&

@@ -934,6 +934,39 @@ def assert_netch_legacy_parser(base_url: str, timeout: int) -> None:
     )
 
 
+def assert_native_text_rules(base_url: str, timeout: int) -> None:
+    config = "\n".join((
+        "enable_rule_generator=true", "overwrite_original_rules=true",
+        "ruleset=DIRECT,clash-classic:http://127.0.0.1:1/native.list?version=1,600",
+        "ruleset=REJECT,clash-classic:http://127.0.0.1:1/native.txt,1800",
+        "ruleset=DIRECT,clash-classic:http://127.0.0.1:1/native.yaml,3600",
+        "ruleset=DIRECT,[]FINAL",
+    ))
+    text = fetch(base_url, "/sub", {
+        "target": "clash", "url": SAMPLE_SS_LINK,
+        "config": "data:text/plain;base64," + base64.b64encode(config.encode()).decode(),
+        "expand": "false", "script": "false",
+    }, timeout)
+    rules = tuple(line.strip().removeprefix("- ") for line in text.splitlines()
+                  if line.strip().startswith(("- RULE-SET,", "- MATCH,")))
+    if rules != ("RULE-SET,native,DIRECT", "RULE-SET,native 2,REJECT",
+                 "RULE-SET,native 3,DIRECT", "MATCH,DIRECT") or "/getruleset?" in text:
+        raise AssertionError(f"Native rule provider order or URLs drifted: {text!r}")
+    for name, suffix, format_, interval in (
+        ("native", ".list?version=1", "text", 600),
+        ("native 2", ".txt", "text", 1800),
+        ("native 3", ".yaml", "yaml", 3600),
+    ):
+        block = provider_block_from_output(text.split("rule-providers:", 1)[1], name)
+        expected_fields = (
+            "    type: http", "    behavior: classical",
+            f"    format: {format_}", f"    interval: {interval}",
+            f"    url: http://127.0.0.1:1/native{suffix}",
+        )
+        if any(field not in block.splitlines() for field in expected_fields):
+            raise AssertionError(f"Native provider {name!r} drifted: {block!r}")
+
+
 def run_checks(
     base_url: str,
     timeout: int,
@@ -945,6 +978,7 @@ def run_checks(
     legacy_subscription_url: str | None,
     verify_non_clash: bool,
 ) -> None:
+    assert_native_text_rules(base_url, timeout)
     health = fetch(base_url, "/healthz", None, timeout)
     if health.strip() != "ok":
         raise AssertionError(f"/healthz returned unexpected body: {health!r}")
