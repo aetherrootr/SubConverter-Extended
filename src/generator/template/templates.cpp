@@ -891,7 +891,9 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
         bool direct_mrs =
             !direct_url.empty() && hasExtension(direct_url, ".mrs");
         bool direct_txt =
-            !direct_url.empty() && hasExtension(direct_url, ".txt");
+            !direct_url.empty() &&
+            (hasExtension(direct_url, ".txt") ||
+             hasExtension(direct_url, ".list"));
         bool direct_yaml =
             !direct_url.empty() &&
             (hasExtension(direct_url, ".yaml") ||

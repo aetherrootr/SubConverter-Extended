@@ -8580,6 +8580,55 @@ def _yaml_named_mapping_block(text: str, section: str, name: str) -> str:
     return "\n".join(lines[entry_index:end])
 
 
+def clash_native_text_rules_baseline(base_url: str, fixture_base: str) -> None:
+    config = "\n".join((
+        "enable_rule_generator=true",
+        "overwrite_original_rules=true",
+        f"ruleset=DIRECT,clash-classic:{fixture_base}/stash-domain-text.list?version=1,600",
+        f"ruleset=REJECT,clash-classic:{fixture_base}/stash-classical.txt,1800",
+        f"ruleset=DIRECT,clash-classic:{fixture_base}/stash-classical-yaml.yaml,3600",
+        "ruleset=DIRECT,[]FINAL",
+    ))
+    status, body, _ = request(base_url, "/sub", {
+        "target": "clash",
+        "url": SUBSCRIPTION.strip(),
+        "config": "data:text/plain;base64," + base64.b64encode(config.encode()).decode(),
+        "expand": "false",
+        "script": "false",
+    })
+    text = body.decode("utf-8", errors="replace")
+    if status != 200:
+        raise AssertionError(f"Clash native rule conversion failed: {status} {text!r}")
+    for name, extension, format_, interval in (
+        ("stash-domain-text", ".list?version=1", "text", 600),
+        ("stash-classical", ".txt", "text", 1800),
+        ("stash-classical-yaml", ".yaml", "yaml", 3600),
+    ):
+        block = _yaml_named_mapping_block(text, "rule-providers", name)
+        expected = (
+            "    type: http",
+            "    behavior: classical",
+            f"    format: {format_}",
+            f"    url: {fixture_base}/{name}{extension}",
+            f"    interval: {interval}",
+        )
+        if any(line not in block.splitlines() for line in expected):
+            raise AssertionError(f"Clash native provider {name!r} drifted: {block!r}")
+        suffix = ".txt" if format_ == "text" else ".yaml"
+        if not any(line.startswith("    path: ") and line.endswith(suffix)
+                   for line in block.splitlines()):
+            raise AssertionError(f"Clash native provider cache format drifted: {block!r}")
+    rules = [line.strip().removeprefix("- ") for line in text.splitlines()
+             if line.strip().startswith(("- RULE-SET,", "- MATCH,"))]
+    if rules != [
+        "RULE-SET,stash-domain-text,DIRECT",
+        "RULE-SET,stash-classical,REJECT",
+        "RULE-SET,stash-classical-yaml,DIRECT",
+        "MATCH,DIRECT",
+    ] or "/getruleset?" in text:
+        raise AssertionError(f"Clash native rule order or source URLs drifted: {text!r}")
+
+
 def stash_target_baseline(base_url: str, fixture_base: str) -> None:
     provider_source = (
         "https://127.0.0.1:1/stash-provider.yaml?token=stash-provider-secret"
@@ -14119,6 +14168,7 @@ def main() -> int:
             target_generation_stats_baseline(base_url)
             v2ray_client_target_baseline(base_url)
             shadowrocket_target_baseline(base_url)
+            clash_native_text_rules_baseline(base_url, fixture_base)
             stash_target_baseline(base_url, fixture_base)
             singbox_import_fidelity_baseline(base_url, fixture_base)
             loon_current_node_output_baseline(base_url)
